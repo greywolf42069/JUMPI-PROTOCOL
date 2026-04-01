@@ -1,0 +1,484 @@
+// JumpiProtocol.huff
+// JUMPI Protocol v2.0 — Hardened Offset-Based Transfer Router with 0.5% Fee Reaping
+// GreyWolf + THEWIRED • 2+2=22 • Flesh is LEGACY
+// Pure Huff • Callable by anyone • Deployer reaps 0.5% of every transfer
+// ERC20 routes via raw calldataload offsets • ETH routes via callvalue math
+// v2.0: Reentrancy guard, pause, token whitelist, fee cap, delegatecall protection
+
+// ══════════════════════════════════════════════════════════════
+// STORAGE LAYOUT
+// ══════════════════════════════════════════════════════════════
+// Slot 0x00: feeRecipient (deployer address, immutable after constructor)
+// Slot 0x01: paused (0 = active, 1 = paused)
+// Slot 0x02: reentrancy lock (0 = unlocked, 1 = locked)
+// Slot 0x03: maxFeeWei (maximum fee per tx in wei, 0 = no cap)
+// Slot 0x04: whitelistEnabled (0 = all tokens allowed, 1 = whitelist only)
+// Slot 0x05: self (contract address, for delegatecall guard)
+// Mapping root 0x06: tokenWhitelist[token] => bool (0/1)
+
+#define constant FEE_RECIPIENT_SLOT      = 0x00
+#define constant PAUSED_SLOT             = 0x01
+#define constant LOCK_SLOT               = 0x02
+#define constant MAX_FEE_SLOT            = 0x03
+#define constant WHITELIST_ENABLED_SLOT  = 0x04
+#define constant SELF_SLOT               = 0x05
+#define constant WHITELIST_MAPPING_SLOT  = 0x06
+
+// Fee: 50 basis points = 0.5%
+// fee = amount * 50 / 10000
+// Minimum fee-bearing amount: 200 wei (below this, fee rounds to 0)
+#define constant FEE_BPS = 0x32
+#define constant BPS_DENOMINATOR = 0x2710
+
+// ══════════════════════════════════════════════════════════════
+// FUNCTION SIGNATURES
+// ══════════════════════════════════════════════════════════════
+
+// Public (user-facing)
+#define function routeToken(address,address,uint256) nonpayable returns (bool)
+#define function routeETH(address) payable returns (bool)
+
+// Admin (deployer only)
+#define function sweepETH() nonpayable returns (bool)
+#define function sweepToken(address) nonpayable returns (bool)
+#define function setPaused(bool) nonpayable returns (bool)
+#define function setWhitelistEnabled(bool) nonpayable returns (bool)
+#define function whitelistToken(address,bool) nonpayable returns (bool)
+#define function setMaxFee(uint256) nonpayable returns (bool)
+
+// View
+#define function getFeeRecipient() view returns (address)
+#define function getFeeBps() view returns (uint256)
+#define function isPaused() view returns (bool)
+#define function isWhitelisted(address) view returns (bool)
+#define function getMaxFee() view returns (uint256)
+#define function isWhitelistEnabled() view returns (bool)
+
+// ══════════════════════════════════════════════════════════════
+// EVENTS
+// ══════════════════════════════════════════════════════════════
+
+#define event TokenRouted(address indexed token, address indexed from, address indexed to, uint256 net, uint256 fee)
+#define event ETHRouted(address indexed from, address indexed to, uint256 net, uint256 fee)
+#define event Swept(address indexed token, uint256 amount)
+#define event ETHSwept(uint256 amount)
+#define event SetPaused(bool status)
+#define event SetWhitelistEnabled(bool status)
+#define event TokenWhitelistUpdated(address indexed token, bool status)
+#define event MaxFeeUpdated(uint256 maxFee)
+
+// ══════════════════════════════════════════════════════════════
+// CONSTRUCTOR — deployer becomes fee recipient, store self for DC guard
+// ══════════════════════════════════════════════════════════════
+
+#define macro CONSTRUCTOR() = {
+    caller [FEE_RECIPIENT_SLOT] sstore
+    address [SELF_SLOT] sstore
+}
+
+// ══════════════════════════════════════════════════════════════
+// MAIN DISPATCH
+// ══════════════════════════════════════════════════════════════
+
+#define macro MAIN() = {
+    // ─── Delegatecall guard: revert if address != stored self ───
+    address [SELF_SLOT] sload eq iszero fail jumpi
+
+    // Guard: need at least 4 bytes
+    0x04 calldatasize lt no_data jumpi
+
+    // Extract selector (loaded ONCE, DUP for each comparison)
+    0x00 calldataload 0xe0 shr             // [selector]
+
+    // Hot path (user-facing)
+    dup1 __FUNC_SIG(routeToken) eq do_route_token jumpi
+    dup1 __FUNC_SIG(routeETH) eq do_route_eth jumpi
+
+    // Admin
+    dup1 __FUNC_SIG(setPaused) eq do_set_paused jumpi
+    dup1 __FUNC_SIG(setWhitelistEnabled) eq do_set_whitelist_enabled jumpi
+    dup1 __FUNC_SIG(whitelistToken) eq do_whitelist_token jumpi
+    dup1 __FUNC_SIG(setMaxFee) eq do_set_max_fee jumpi
+    dup1 __FUNC_SIG(sweepETH) eq do_sweep_eth jumpi
+    dup1 __FUNC_SIG(sweepToken) eq do_sweep_token jumpi
+
+    // View
+    dup1 __FUNC_SIG(getFeeRecipient) eq do_get_fee_recipient jumpi
+    dup1 __FUNC_SIG(getFeeBps) eq do_get_fee_bps jumpi
+    dup1 __FUNC_SIG(isPaused) eq do_is_paused jumpi
+    dup1 __FUNC_SIG(isWhitelisted) eq do_is_whitelisted jumpi
+    dup1 __FUNC_SIG(getMaxFee) eq do_get_max_fee jumpi
+    dup1 __FUNC_SIG(isWhitelistEnabled) eq do_is_whitelist_enabled jumpi
+
+    no_data:
+        0x00 0x00 revert
+
+    // ═══════════════ routeToken ═══════════════
+    // routeToken(address token, address to, uint256 amount)
+    //   0x04: token | 0x24: to | 0x44: amount
+    // Guards: reentrancy, pause, whitelist, fee cap
+    do_route_token:
+        pop                                    // drop selector
+
+        // ─── Reentrancy guard ───
+        [LOCK_SLOT] sload fail jumpi           // revert if locked
+        0x01 [LOCK_SLOT] sstore               // lock
+
+        // ─── Pause check ───
+        [PAUSED_SLOT] sload fail jumpi         // revert if paused
+
+        // ─── Load & validate params via raw offsets ───
+        0x04 calldataload                      // [token]
+        dup1 iszero fail jumpi
+        0x24 calldataload                      // [to, token]
+        dup1 iszero fail jumpi
+        0x44 calldataload                      // [amount, to, token]
+        dup1 iszero fail jumpi
+
+        // ─── Whitelist check (if enabled) ───
+        [WHITELIST_ENABLED_SLOT] sload         // [wlEnabled, amount, to, token]
+        iszero rt_skip_wl jumpi                // skip if disabled (0)
+        // Whitelist enabled: check token is whitelisted
+        dup3                                   // [token, amount, to, token]
+        0x00 mstore                            // mem[0x00] = token
+        [WHITELIST_MAPPING_SLOT] 0x20 mstore   // mem[0x20] = mapping slot
+        0x40 0x00 sha3                         // [mapKey, amount, to, token]
+        sload                                  // [whitelisted, amount, to, token]
+        iszero fail jumpi                      // revert if not whitelisted
+
+        rt_skip_wl:
+        // Stack: [amount, to, token]
+
+        // ─── Compute fee = amount * FEE_BPS / BPS_DENOMINATOR ───
+        dup1                                   // [amount, amount, to, token]
+        [FEE_BPS] mul                          // [amount*50, amount, to, token]
+        [BPS_DENOMINATOR] swap1 div            // [fee, amount, to, token]
+
+        // ─── Cap fee if maxFee > 0 and fee > maxFee ───
+        [MAX_FEE_SLOT] sload                   // [maxFee, fee, amount, to, token]
+        dup1 iszero rt_no_cap jumpi            // maxFee == 0? no cap
+        dup1 dup3                              // [fee, maxFee, maxFee, fee, amount, to, token]
+        gt iszero rt_no_cap jumpi              // fee <= maxFee? no cap
+        // fee > maxFee: replace fee with maxFee
+        swap1 pop                              // [maxFee, amount, to, token]
+        rt_cap_done jump
+
+        rt_no_cap:
+        pop                                    // drop maxFee; [fee, amount, to, token]
+
+        rt_cap_done:
+        // Stack: [effective_fee, amount, to, token]
+
+        // ─── Compute net = amount - effective_fee ───
+        swap1                                  // [amount, effective_fee, to, token]
+        dup2                                   // [effective_fee, amount, effective_fee, to, token]
+        swap1 sub                              // [net, effective_fee, to, token]
+
+        // ─── Call 1: transferFrom(caller, to, net) ───
+        0x23b872dd 0xe0 shl 0x00 mstore       // mem[0x00] = transferFrom selector
+        caller 0x04 mstore                     // mem[0x04] = from (msg.sender)
+        dup3 0x24 mstore                       // mem[0x24] = to
+        dup1 0x44 mstore                       // mem[0x44] = net
+        // Stack: [net, effective_fee, to, token]
+
+        // CALL(gas, addr=token, value=0, argsOff=0, argsLen=0x64, retOff=0x80, retLen=0x20)
+        0x20 0x80 0x64 0x00 0x00               // 5 pushes
+        dup9                                   // token (pos: 5+4=9)
+        gas call                               // [success, net, effective_fee, to, token]
+        iszero fail jumpi
+
+        // ─── Call 2: transferFrom(caller, feeRecipient, effective_fee) ───
+        // Stack: [net, effective_fee, to, token]
+        0x23b872dd 0xe0 shl 0x00 mstore       // selector
+        caller 0x04 mstore                     // from = caller
+        [FEE_RECIPIENT_SLOT] sload 0x24 mstore // to = feeRecipient
+        dup2 0x44 mstore                       // amount = effective_fee
+
+        0x20 0x80 0x64 0x00 0x00
+        dup9                                   // token (pos 9)
+        gas call
+        iszero fail jumpi
+        // Stack: [net, effective_fee, to, token]
+
+        // ─── Emit TokenRouted(token, caller, to, net, fee) ───
+        dup1 0x00 mstore                       // mem[0x00] = net
+        dup2 0x20 mstore                       // mem[0x20] = effective_fee
+        dup3                                   // [to]
+        caller                                 // [caller, to]
+        dup6                                   // [token] (net=1,fee=2,to=3,token=4 + pushed 2 = 6)
+        __EVENT_HASH(TokenRouted)              // [topic0, token, caller, to]
+        0x40 0x00                              // [offset, size]
+        log4
+
+        // ─── Unlock reentrancy guard ───
+        0x00 [LOCK_SLOT] sstore
+
+        // Return true
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ routeETH ═══════════════
+    // routeETH(address to) payable
+    //   0x04: recipient
+    // Guards: reentrancy, pause, fee cap
+    do_route_eth:
+        pop                                    // drop selector
+
+        // ─── Reentrancy guard ───
+        [LOCK_SLOT] sload fail jumpi
+        0x01 [LOCK_SLOT] sstore
+
+        // ─── Pause check ───
+        [PAUSED_SLOT] sload fail jumpi
+
+        0x04 calldataload                      // [to]
+        dup1 iszero fail jumpi
+        callvalue iszero fail jumpi            // must send ETH
+        // Stack: [to]
+
+        // ─── Compute fee = callvalue * 50 / 10000 ───
+        callvalue                              // [value, to]
+        dup1                                   // [value, value, to]
+        [FEE_BPS] mul                          // [value*50, value, to]
+        [BPS_DENOMINATOR] swap1 div            // [fee, value, to]
+
+        // ─── Cap fee if maxFee > 0 and fee > maxFee ───
+        [MAX_FEE_SLOT] sload                   // [maxFee, fee, value, to]
+        dup1 iszero re_no_cap jumpi
+        dup1 dup3                              // [fee, maxFee, maxFee, fee, value, to]
+        gt iszero re_no_cap jumpi
+        swap1 pop                              // [maxFee, value, to]
+        re_cap_done jump
+
+        re_no_cap:
+        pop                                    // [fee, value, to]
+
+        re_cap_done:
+        // Stack: [effective_fee, value, to]
+
+        // ─── Compute net = value - effective_fee ───
+        swap1                                  // [value, effective_fee, to]
+        dup2                                   // [effective_fee, value, effective_fee, to]
+        swap1 sub                              // [net, effective_fee, to]
+
+        // ─── Send net ETH to recipient ───
+        0x00 0x00 0x00 0x00                    // [0, 0, 0, 0]
+        dup5                                   // [net] (pos 5)
+        dup8                                   // [to] (pos 8 after dup5 shift)
+        gas call                               // [success, net, effective_fee, to]
+        iszero fail jumpi
+        // Stack: [net, effective_fee, to]
+        // Fee stays in contract balance
+
+        // ─── Emit ETHRouted(caller, to, net, fee) ───
+        dup1 0x00 mstore                       // mem[0x00] = net
+        dup2 0x20 mstore                       // mem[0x20] = effective_fee
+        dup3                                   // [to]
+        caller                                 // [caller, to]
+        __EVENT_HASH(ETHRouted)                // [topic0, caller, to]
+        0x40 0x00                              // [offset, size]
+        log3
+
+        // ─── Unlock reentrancy guard ───
+        0x00 [LOCK_SLOT] sstore
+
+        // Return true
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ sweepETH ═══════════════
+    // Only feeRecipient (deployer) can call
+    // NO pause check — emergency withdraw capability
+    do_sweep_eth:
+        pop
+
+        // Only deployer
+        [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
+
+        // Get balance
+        selfbalance                            // [balance]
+        dup1 iszero fail jumpi                 // nothing to sweep
+
+        // Send all ETH to caller
+        0x00 0x00 0x00 0x00                    // [0, 0, 0, 0]
+        dup5                                   // [balance] (pos 5)
+        caller                                 // [caller]
+        gas call                               // [success, balance]
+        iszero fail jumpi
+        // Stack: [balance]
+
+        // Emit ETHSwept(amount)
+        dup1 0x00 mstore                       // data = balance
+        __EVENT_HASH(ETHSwept)                 // [topic0, balance]
+        0x20 0x00                              // [offset, size]
+        log1
+        // Stack: [balance]
+
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ sweepToken ═══════════════
+    // Only feeRecipient (deployer) can call
+    // NO pause check — emergency withdraw capability
+    do_sweep_token:
+        pop
+
+        // Only deployer
+        [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
+
+        0x04 calldataload                      // [token]
+        dup1 iszero fail jumpi
+
+        // ─── Call balanceOf(address(this)) ───
+        0x70a08231 0xe0 shl 0x00 mstore        // balanceOf selector
+        address 0x04 mstore                    // address(this)
+        0x20 0x80 0x24 0x00                    // [retLen=0x20, retOff=0x80, argsLen=0x24, argsOff=0x00]
+        dup5                                   // [token] (pos 5)
+        gas staticcall                         // [success, token]
+        iszero fail jumpi
+        // Stack: [token]
+
+        0x80 mload                             // [balance, token]
+        dup1 iszero fail jumpi                 // nothing to sweep
+
+        // ─── Call transfer(caller, balance) ───
+        0xa9059cbb 0xe0 shl 0x00 mstore        // transfer selector
+        caller 0x04 mstore                     // to = caller
+        dup1 0x24 mstore                       // amount = balance
+        // Stack: [balance, token]
+
+        0x20 0x80 0x44 0x00 0x00               // 5 pushes
+        dup7                                   // [token] (pos 7)
+        gas call                               // [success, balance, token]
+        iszero fail jumpi
+        // Stack: [balance, token]
+
+        // Emit Swept(token, amount)
+        dup1 0x00 mstore                       // data = balance
+        dup2                                   // [token]
+        __EVENT_HASH(Swept)                    // [topic0, token]
+        0x20 0x00                              // [offset, size]
+        log2
+
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ setPaused (admin) ═══════════════
+    do_set_paused:
+        pop
+        [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
+        0x04 calldataload [PAUSED_SLOT] sstore
+
+        // Emit SetPaused(status)
+        0x04 calldataload 0x00 mstore
+        __EVENT_HASH(SetPaused)
+        0x20 0x00
+        log1
+
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ setWhitelistEnabled (admin) ═══════════════
+    do_set_whitelist_enabled:
+        pop
+        [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
+        0x04 calldataload [WHITELIST_ENABLED_SLOT] sstore
+
+        // Emit SetWhitelistEnabled(status)
+        0x04 calldataload 0x00 mstore
+        __EVENT_HASH(SetWhitelistEnabled)
+        0x20 0x00
+        log1
+
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ whitelistToken (admin) ═══════════════
+    // whitelistToken(address token, bool status)
+    //   0x04: token | 0x24: status (0 or 1)
+    do_whitelist_token:
+        pop
+        [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
+
+        0x04 calldataload                      // [token]
+        dup1 iszero fail jumpi                 // no zero address
+
+        // Compute mapping slot = keccak256(token || WHITELIST_MAPPING_SLOT)
+        0x00 mstore                            // mem[0x00] = token
+        [WHITELIST_MAPPING_SLOT] 0x20 mstore
+        0x40 0x00 sha3                         // [mapSlot]
+
+        // Store status
+        0x24 calldataload swap1 sstore
+
+        // Emit TokenWhitelistUpdated(token, status)
+        0x24 calldataload 0x00 mstore          // data = status
+        0x04 calldataload                      // [token]
+        __EVENT_HASH(TokenWhitelistUpdated)
+        0x20 0x00
+        log2
+
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ setMaxFee (admin) ═══════════════
+    do_set_max_fee:
+        pop
+        [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
+        0x04 calldataload [MAX_FEE_SLOT] sstore
+
+        // Emit MaxFeeUpdated(maxFee)
+        0x04 calldataload 0x00 mstore
+        __EVENT_HASH(MaxFeeUpdated)
+        0x20 0x00
+        log1
+
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ VIEW FUNCTIONS ═══════════════
+
+    do_get_fee_recipient:
+        pop
+        [FEE_RECIPIENT_SLOT] sload
+        0x00 mstore
+        0x20 0x00 return
+
+    do_get_fee_bps:
+        pop
+        [FEE_BPS]
+        0x00 mstore
+        0x20 0x00 return
+
+    do_is_paused:
+        pop
+        [PAUSED_SLOT] sload
+        0x00 mstore
+        0x20 0x00 return
+
+    do_is_whitelisted:
+        pop
+        0x04 calldataload
+        0x00 mstore
+        [WHITELIST_MAPPING_SLOT] 0x20 mstore
+        0x40 0x00 sha3
+        sload
+        0x00 mstore
+        0x20 0x00 return
+
+    do_get_max_fee:
+        pop
+        [MAX_FEE_SLOT] sload
+        0x00 mstore
+        0x20 0x00 return
+
+    do_is_whitelist_enabled:
+        pop
+        [WHITELIST_ENABLED_SLOT] sload
+        0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ FAIL ═══════════════
+    fail:
+        0x00 0x00 revert
+}
