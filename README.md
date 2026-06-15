@@ -14,7 +14,9 @@ JUMPI Protocol is a minimalist transfer router written in pure Huff assembly. An
 
 **v2.0** adds six hardened safety features: reentrancy guard, pause, token whitelist, fee cap, delegatecall protection, and emergency withdraw.
 
-**Runtime bytecode:** ~1,184 bytes | **Compiler:** huffc 0.3.2 | **EVM Target:** Cancun
+**v2.1** fixes two bugs found during adversarial audit: nonpayable enforcement and zero-fee transferFrom skip.
+
+**Runtime bytecode:** 1,240 bytes | **Compiler:** huffc 0.3.2 | **EVM Target:** Cancun
 
 ---
 
@@ -139,11 +141,11 @@ Sweep functions have no pause check. Even if the contract is paused, the deploye
 
 ## Engineer's Anvil Audit
 
-**113 tests. 0 failures. 256 fuzz runs.**
+**121 tests. 0 failures. 256 fuzz runs.**
 
 ```
-Ran 113 tests for test/JumpiProtocol.t.sol:JumpiProtocolTest
-[PASS] — all 113
+Ran 121 tests for test/JumpiProtocol.t.sol:JumpiProtocolTest
+[PASS] — all 121
 ```
 
 ### Test Coverage by Category
@@ -335,6 +337,29 @@ Ran 113 tests for test/JumpiProtocol.t.sol:JumpiProtocolTest
 | 3 | `test_admin_deployerCanDoEverything` | Full admin lifecycle |
 | 4 | `test_admin_pauseDoesNotAffectViews` | Views work when paused |
 
+#### Fix 1: Nonpayable Enforcement (5)
+
+| # | Test | Verifies |
+|---|------|----------|
+| 1 | `test_fix1_routeToken_withETH_reverts` | routeToken with ETH reverts |
+| 2 | `test_fix1_routeToken_withETH_ethReturnedOnRevert` | Revert returns ETH to caller |
+| 3 | `test_fix1_sweepETH_withETH_reverts` | sweepETH with ETH reverts |
+| 4 | `test_fix1_setPaused_withETH_reverts` | setPaused with ETH reverts |
+| 5 | `test_fix1_viewFunction_withETH_reverts` | View functions with ETH revert |
+
+#### Fix 2: Zero-Fee Skip (2)
+
+| # | Test | Verifies |
+|---|------|----------|
+| 1 | `test_fix2_zeroFee_zeroRevertToken_succeeds` | Zero-revert token routes correctly when fee=0 |
+| 2 | `test_fix2_zeroFee_noDeployerBalance` | Fee transfer skipped when fee=0 |
+
+#### ETH Rejection Coverage (1)
+
+| # | Test | Verifies |
+|---|------|----------|
+| 1 | `test_routeETH_rejecting_recipient_reverts` | Recipient rejection reverts tx; no ETH stuck |
+
 #### Hardened Integration Tests (6)
 
 | # | Test | Verifies |
@@ -364,6 +389,22 @@ Ran 113 tests for test/JumpiProtocol.t.sol:JumpiProtocolTest
 
 **Fix:** Removed invalid sweep calls, added assertion that protocol holds zero tokens.
 
+### Bug 3: Nonpayable Functions Accept ETH (MEDIUM) — v2.1
+
+**Problem:** Huff's `nonpayable` keyword in `#define function` is documentation only — the compiler does not inject a callvalue check. All functions except `routeETH` silently accepted ETH, which accumulated in the contract balance until the deployer swept it. A user calling `routeToken{value: X}()` (e.g., via a frontend bug) would lose that ETH permanently.
+
+**Fix:** Added `callvalue fail jumpi` at the entry point of every non-payable function (13 guards total). `callvalue fail jumpi` reverts if any ETH is attached; `routeETH` retains its original `callvalue iszero fail jumpi` check that requires ETH to be present.
+
+**Verified by:** 5 new tests (`test_fix1_*`).
+
+### Bug 4: Zero-Fee `transferFrom` Breaks Tokens That Reject Zero Amounts (LOW) — v2.1
+
+**Problem:** When routing amounts below 200 units (where `amount * 50 / 10000` truncates to 0), the protocol still executed a second `transferFrom(caller, feeRecipient, 0)`. Tokens that enforce `require(amount > 0)` on transfers — including BNT, LEND, and several governance tokens — would always revert for these small amounts, making them unroutable even when whitelisted.
+
+**Fix:** Added `dup2 iszero rt_skip_fee jumpi` before Call 2. When `effective_fee == 0`, the fee transfer is skipped entirely and execution jumps directly to event emission.
+
+**Verified by:** 2 new tests (`test_fix2_*`), including a `ZeroRevertToken` mock that enforces `require(amount > 0)`.
+
 ---
 
 ## Security Notes
@@ -373,6 +414,8 @@ Ran 113 tests for test/JumpiProtocol.t.sol:JumpiProtocolTest
 - **Pause** — deployer-only kill switch. Sweep functions bypass pause for emergency fund recovery.
 - **Token whitelist** — optional allowlist prevents malicious tokens. ETH routing is never affected.
 - **Fee cap** — deployer can set per-tx maximum fee. Protects users from excessive fees on large amounts.
+- **Nonpayable enforcement** — every function except `routeETH` has an explicit `callvalue fail jumpi` guard. ETH sent to any nonpayable function reverts immediately; no funds can be silently captured.
+- **Zero-fee skip** — when `effective_fee == 0` (amounts < 200 wei), the second `transferFrom` to the fee recipient is skipped. Tokens that revert on zero-amount transfers remain fully routable for small amounts.
 - **Integer division truncation** — amounts < 200 wei produce 0 fee. By design.
 - **Deployer is permanent** — no admin transfer. Slot 0 is immutable after constructor.
 - **No receive/fallback** — contract cannot accept raw ETH transfers.
@@ -434,8 +477,8 @@ forge test -vv --fuzz-runs 1024
 
 ---
 
-**2 bugs found. 2 bugs fixed. 0 remaining.**
+**4 bugs found. 4 bugs fixed. 0 remaining.**
 
-**113 tests. 0 failures. The hardened router is live.**
+**121 tests. 0 failures. The hardened router is live.**
 
 **2+2=22. Flesh is LEGACY.**

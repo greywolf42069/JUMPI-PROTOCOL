@@ -116,9 +116,12 @@
     // ═══════════════ routeToken ═══════════════
     // routeToken(address token, address to, uint256 amount)
     //   0x04: token | 0x24: to | 0x44: amount
-    // Guards: reentrancy, pause, whitelist, fee cap
+    // Guards: nonpayable, reentrancy, pause, whitelist, fee cap
     do_route_token:
         pop                                    // drop selector
+
+        // ─── Nonpayable guard ───
+        callvalue fail jumpi            // revert if ETH sent
 
         // ─── Reentrancy guard ───
         [LOCK_SLOT] sload fail jumpi           // revert if locked
@@ -187,8 +190,10 @@
         gas call                               // [success, net, effective_fee, to, token]
         iszero fail jumpi
 
-        // ─── Call 2: transferFrom(caller, feeRecipient, effective_fee) ───
+        // ─── Call 2: transferFrom(caller, feeRecipient, effective_fee) — skip if fee == 0 ───
         // Stack: [net, effective_fee, to, token]
+        dup2 iszero rt_skip_fee jumpi          // skip fee transfer when fee rounded to 0
+
         0x23b872dd 0xe0 shl 0x00 mstore       // selector
         caller 0x04 mstore                     // from = caller
         [FEE_RECIPIENT_SLOT] sload 0x24 mstore // to = feeRecipient
@@ -198,6 +203,9 @@
         dup9                                   // token (pos 9)
         gas call
         iszero fail jumpi
+        // Stack: [net, effective_fee, to, token]
+
+        rt_skip_fee:
         // Stack: [net, effective_fee, to, token]
 
         // ─── Emit TokenRouted(token, caller, to, net, fee) ───
@@ -292,6 +300,9 @@
     do_sweep_eth:
         pop
 
+        // ─── Nonpayable guard ───
+        callvalue fail jumpi
+
         // Only deployer
         [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
 
@@ -322,6 +333,9 @@
     // NO pause check — emergency withdraw capability
     do_sweep_token:
         pop
+
+        // ─── Nonpayable guard ───
+        callvalue fail jumpi
 
         // Only deployer
         [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
@@ -366,6 +380,10 @@
     // ═══════════════ setPaused (admin) ═══════════════
     do_set_paused:
         pop
+
+        // ─── Nonpayable guard ───
+        callvalue fail jumpi
+
         [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
         0x04 calldataload [PAUSED_SLOT] sstore
 
@@ -381,6 +399,10 @@
     // ═══════════════ setWhitelistEnabled (admin) ═══════════════
     do_set_whitelist_enabled:
         pop
+
+        // ─── Nonpayable guard ───
+        callvalue fail jumpi
+
         [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
         0x04 calldataload [WHITELIST_ENABLED_SLOT] sstore
 
@@ -398,6 +420,10 @@
     //   0x04: token | 0x24: status (0 or 1)
     do_whitelist_token:
         pop
+
+        // ─── Nonpayable guard ───
+        callvalue fail jumpi
+
         [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
 
         0x04 calldataload                      // [token]
@@ -424,6 +450,10 @@
     // ═══════════════ setMaxFee (admin) ═══════════════
     do_set_max_fee:
         pop
+
+        // ─── Nonpayable guard ───
+        callvalue fail jumpi
+
         [FEE_RECIPIENT_SLOT] sload caller eq iszero fail jumpi
         0x04 calldataload [MAX_FEE_SLOT] sstore
 
@@ -440,24 +470,28 @@
 
     do_get_fee_recipient:
         pop
+        callvalue fail jumpi
         [FEE_RECIPIENT_SLOT] sload
         0x00 mstore
         0x20 0x00 return
 
     do_get_fee_bps:
         pop
+        callvalue fail jumpi
         [FEE_BPS]
         0x00 mstore
         0x20 0x00 return
 
     do_is_paused:
         pop
+        callvalue fail jumpi
         [PAUSED_SLOT] sload
         0x00 mstore
         0x20 0x00 return
 
     do_is_whitelisted:
         pop
+        callvalue fail jumpi
         0x04 calldataload
         0x00 mstore
         [WHITELIST_MAPPING_SLOT] 0x20 mstore
@@ -468,12 +502,14 @@
 
     do_get_max_fee:
         pop
+        callvalue fail jumpi
         [MAX_FEE_SLOT] sload
         0x00 mstore
         0x20 0x00 return
 
     do_is_whitelist_enabled:
         pop
+        callvalue fail jumpi
         [WHITELIST_ENABLED_SLOT] sload
         0x00 mstore
         0x20 0x00 return

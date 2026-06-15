@@ -81,6 +81,31 @@ contract DelegateCaller {
     }
 }
 
+// ERC20 that reverts on zero-amount transfers (mirrors real-world tokens like BNT, LEND)
+contract ZeroRevertToken {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(amount > 0, "zero transfer rejected");
+        require(allowance[from][msg.sender] >= amount, "insufficient allowance");
+        require(balanceOf[from] >= amount, "insufficient balance");
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
 // ══════════════════════════════════════════════════════════════
 // Interface
 // ══════════════════════════════════════════════════════════════
@@ -1397,5 +1422,107 @@ contract JumpiProtocolTest is Test {
             abi.encodeWithSelector(IJumpiProtocol.routeToken.selector, address(token2), bob, 1000e18)
         );
         assertFalse(ok);
+    }
+
+    // ═══════════════ FIX 1: NONPAYABLE ENFORCEMENT (5) ═══════════════
+
+    function test_fix1_routeToken_withETH_reverts() public {
+        vm.prank(alice);
+        (bool ok,) = address(protocol).call{value: 1 ether}(
+            abi.encodeWithSelector(IJumpiProtocol.routeToken.selector, address(token), bob, 1000e18)
+        );
+        assertFalse(ok);
+        assertEq(address(protocol).balance, 0); // no ETH captured
+    }
+
+    function test_fix1_routeToken_withETH_ethReturnedOnRevert() public {
+        uint256 aliceEthBefore = alice.balance;
+        vm.prank(alice);
+        (bool ok,) = address(protocol).call{value: 0.5 ether}(
+            abi.encodeWithSelector(IJumpiProtocol.routeToken.selector, address(token), bob, 1000e18)
+        );
+        assertFalse(ok);
+        assertEq(alice.balance, aliceEthBefore); // revert returns ETH to caller
+    }
+
+    function test_fix1_sweepETH_withETH_reverts() public {
+        vm.prank(alice);
+        protocol.routeETH{value: 1 ether}(bob);
+        uint256 feeBefore = address(protocol).balance;
+
+        vm.deal(deployer, 0.1 ether);
+        vm.prank(deployer);
+        (bool ok,) = address(protocol).call{value: 0.1 ether}(
+            abi.encodeWithSelector(IJumpiProtocol.sweepETH.selector)
+        );
+        assertFalse(ok);
+        assertEq(address(protocol).balance, feeBefore); // fees intact, nothing swept
+    }
+
+    function test_fix1_setPaused_withETH_reverts() public {
+        vm.deal(deployer, 0.1 ether);
+        vm.prank(deployer);
+        (bool ok,) = address(protocol).call{value: 0.1 ether}(
+            abi.encodeWithSelector(IJumpiProtocol.setPaused.selector, true)
+        );
+        assertFalse(ok);
+        assertFalse(protocol.isPaused()); // state unchanged
+        assertEq(address(protocol).balance, 0);
+    }
+
+    function test_fix1_viewFunction_withETH_reverts() public {
+        vm.prank(alice);
+        (bool ok,) = address(protocol).call{value: 0.01 ether}(
+            abi.encodeWithSelector(IJumpiProtocol.getFeeRecipient.selector)
+        );
+        assertFalse(ok);
+        assertEq(address(protocol).balance, 0); // no ETH captured
+    }
+
+    // ═══════════════ FIX 2: ZERO-FEE SKIP (2) ═══════════════
+
+    function test_fix2_zeroFee_zeroRevertToken_succeeds() public {
+        // ZeroRevertToken reverts if transferFrom is called with amount=0.
+        // Before this fix, routing amounts < 200 would call transferFrom(caller, feeRecipient, 0)
+        // and revert. Now the second call is skipped entirely.
+        ZeroRevertToken zrt = new ZeroRevertToken();
+        uint256 amount = 199; // fee = 199 * 50 / 10000 = 0
+        zrt.mint(alice, amount);
+        vm.prank(alice);
+        zrt.approve(address(protocol), type(uint256).max);
+
+        uint256 bobBefore = zrt.balanceOf(bob);
+        vm.prank(alice);
+        bool ok = protocol.routeToken(address(zrt), bob, amount);
+        assertTrue(ok);
+        assertEq(zrt.balanceOf(bob) - bobBefore, amount); // bob gets all 199
+        assertEq(zrt.balanceOf(deployer), 0);             // deployer gets nothing (fee=0)
+    }
+
+    function test_fix2_zeroFee_noDeployerBalance() public {
+        // Amount 1: fee = 0, net = 1. Deployer receives nothing.
+        token.mint(alice, 1);
+        uint256 deployerBefore = token.balanceOf(deployer);
+
+        vm.prank(alice);
+        bool ok = protocol.routeToken(address(token), bob, 1);
+        assertTrue(ok);
+        assertEq(token.balanceOf(deployer), deployerBefore); // no change — second call skipped
+    }
+
+    // ═══════════════ ETH REJECTION COVERAGE (1) ═══════════════
+
+    function test_routeETH_rejecting_recipient_reverts() public {
+        // routeETH to a contract with no receive/fallback should revert the entire tx.
+        // No ETH gets stuck in protocol (claim from README verified here).
+        ETHRejecter rejecter = new ETHRejecter();
+
+        vm.prank(alice);
+        (bool ok,) = address(protocol).call{value: 1 ether}(
+            abi.encodeWithSelector(IJumpiProtocol.routeETH.selector, address(rejecter))
+        );
+        assertFalse(ok);
+        assertEq(address(rejecter).balance, 0);  // nothing sent to rejecter
+        assertEq(address(protocol).balance, 0);  // no ETH stuck in protocol
     }
 }
